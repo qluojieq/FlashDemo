@@ -276,19 +276,31 @@ public class MainActivity extends AppCompatActivity {
             captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
             setAutoFlash(captureBuilder);
 
-            // 修复：将 JPEG_ORIENTATION 设置为 0
-            // 因为我们在 readerListener 的后处理流程 processBitmapAndSave 中统一根据传感器方向手动旋转位图。
-            // 如果这里设置了非零值，某些设备硬件会提前旋转像素，导致我们的后处理产生“二次旋转”错误。
+            // 核心修复：锁定 AE 确保连拍过程中闪光灯和曝光参数保持一致
+            captureBuilder.set(CaptureRequest.CONTROL_AE_LOCK, true);
             captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, 0);
 
-            CameraCaptureSession.CaptureCallback captureCallback = new CameraCaptureSession.CaptureCallback() {
-                @Override
-                public void onCaptureCompleted(@NonNull CameraCaptureSession session, @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
-                    unlockFocus();
+            if (isYuvMode) {
+                // YUV 模式：连拍 3 张
+                List<CaptureRequest> burstRequests = new ArrayList<>();
+                for (int i = 0; i < 3; i++) {
+                    burstRequests.add(captureBuilder.build());
                 }
-            };
-            
-            cameraCaptureSessions.capture(captureBuilder.build(), captureCallback, mBackgroundHandler);
+                cameraCaptureSessions.captureBurst(burstRequests, new CameraCaptureSession.CaptureCallback() {
+                    @Override
+                    public void onCaptureSequenceCompleted(@NonNull CameraCaptureSession session, int sequenceId, long frameNumber) {
+                        unlockFocus();
+                    }
+                }, mBackgroundHandler);
+            } else {
+                // JPEG 模式：单拍 1 张
+                cameraCaptureSessions.capture(captureBuilder.build(), new CameraCaptureSession.CaptureCallback() {
+                    @Override
+                    public void onCaptureCompleted(@NonNull CameraCaptureSession session, @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
+                        unlockFocus();
+                    }
+                }, mBackgroundHandler);
+            }
         } catch (CameraAccessException e) { e.printStackTrace(); }
     }
 
@@ -299,6 +311,8 @@ public class MainActivity extends AppCompatActivity {
                 captureRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_CANCEL);
             }
             
+            // 恢复预览前必须解锁 AE
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, false);
             captureRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
             cameraCaptureSessions.capture(captureRequestBuilder.build(), null, mBackgroundHandler);
 
@@ -375,7 +389,9 @@ public class MainActivity extends AppCompatActivity {
             if (outputSizes != null && outputSizes.length > 0) {
                 width = outputSizes[0].getWidth(); height = outputSizes[0].getHeight();
             }
-            imageReader = ImageReader.newInstance(width, height, format, 2);
+            // 修复：如果处于连拍模式，增加 maxImages 缓存容量，防止丢帧
+            int maxImages = isYuvMode ? 6 : 2;
+            imageReader = ImageReader.newInstance(width, height, format, maxImages);
             imageReader.setOnImageAvailableListener(readerListener, mBackgroundHandler);
 
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -389,10 +405,12 @@ public class MainActivity extends AppCompatActivity {
     private final ImageReader.OnImageAvailableListener readerListener = new ImageReader.OnImageAvailableListener() {
         @Override
         public void onImageAvailable(ImageReader reader) {
-            long totalPipeStart = System.currentTimeMillis();
-            try (Image image = reader.acquireLatestImage()) {
+            // 核心修复：使用 acquireNextImage 而不是 acquireLatestImage
+            // acquireLatestImage 会丢弃旧帧，导致连拍时只能拿到最后一张或中间丢帧。
+            try (Image image = reader.acquireNextImage()) {
                 if (image == null) return;
                 
+                long totalPipeStart = System.currentTimeMillis();
                 int rotation = getWindowManager().getDefaultDisplay().getRotation();
                 int orientation = (ORIENTATIONS.get(rotation) + sensorOrientation + 270) % 360;
 
@@ -408,12 +426,13 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
                 
-                // 核心：合并旋转校正和水印处理，减少编解码次数
                 byte[] finalJpeg = processBitmapAndSave(bitmap, orientation, "Brandon");
                 saveToGallery(finalJpeg, "jpg");
                 
                 Log.d(TAG, "Total Image Pipeline took: " + (System.currentTimeMillis() - totalPipeStart) + " ms");
-            } catch (IOException e) { Log.e(TAG, "Error processing image", e); }
+            } catch (IOException e) { 
+                Log.e(TAG, "Error processing image", e); 
+            }
         }
     };
 
@@ -500,7 +519,7 @@ public class MainActivity extends AppCompatActivity {
         return nv21;
     }
 
-    // 合并旋转、水印和压缩，只进行一次位图操作和压缩
+    // 合并旋转、水印 and 压缩，只进行一次位图操作和压缩
     private byte[] processBitmapAndSave(Bitmap source, int orientation, String text) {
         long start = System.currentTimeMillis();
         int width = source.getWidth();
