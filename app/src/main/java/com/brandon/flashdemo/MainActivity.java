@@ -10,8 +10,11 @@ import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ImageFormat;
+import android.graphics.Matrix;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.SurfaceTexture;
+import android.graphics.YuvImage;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
@@ -42,6 +45,7 @@ import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.ImageView;
+import android.widget.Switch;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
@@ -49,6 +53,8 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -69,7 +75,7 @@ public class MainActivity extends AppCompatActivity {
     private static final int STATE_PICTURE_TAKEN = 2;
 
     private int mState = STATE_PREVIEW;
-    private long mTriggerFrameNumber = -1; // 用于过滤陈旧帧
+    private long mTriggerFrameNumber = -1;
 
     private static final SparseIntArray ORIENTATIONS = new SparseIntArray();
     static {
@@ -82,6 +88,7 @@ public class MainActivity extends AppCompatActivity {
     private TextureView textureView;
     private ImageView ivThumbnail;
     private Button btnCapture;
+    private Switch swFormat;
 
     private String cameraId;
     protected CameraDevice cameraDevice;
@@ -92,6 +99,7 @@ public class MainActivity extends AppCompatActivity {
     private ImageReader imageReader;
     private boolean mFlashSupported;
     private Surface previewSurface;
+    private boolean isYuvMode = false;
 
     private Handler mBackgroundHandler;
     private HandlerThread mBackgroundThread;
@@ -108,6 +116,7 @@ public class MainActivity extends AppCompatActivity {
         textureView = findViewById(R.id.textureView);
         ivThumbnail = findViewById(R.id.iv_thumbnail);
         btnCapture = findViewById(R.id.btn_capture);
+        swFormat = findViewById(R.id.sw_format);
 
         textureView.setSurfaceTextureListener(textureListener);
         btnCapture.setOnClickListener(v -> takePicture());
@@ -118,6 +127,18 @@ public class MainActivity extends AppCompatActivity {
                 startActivity(intent);
             }
         });
+
+        swFormat.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            isYuvMode = isChecked;
+            reopenCamera();
+        });
+    }
+
+    private void reopenCamera() {
+        if (cameraDevice != null) {
+            closeCamera();
+            openCamera();
+        }
     }
 
     private void hideSystemUI() {
@@ -157,7 +178,7 @@ public class MainActivity extends AppCompatActivity {
             cameraDevice = camera;
             createCameraPreview();
         }
-        @Override public void onDisconnected(@NonNull CameraDevice camera) { cameraDevice.close(); }
+        @Override public void onDisconnected(@NonNull CameraDevice camera) { cameraDevice.close(); cameraDevice = null; }
         @Override public void onError(@NonNull CameraDevice camera, int error) {
             if (cameraDevice != null) { cameraDevice.close(); cameraDevice = null; }
         }
@@ -168,7 +189,6 @@ public class MainActivity extends AppCompatActivity {
             switch (mState) {
                 case STATE_PREVIEW: break;
                 case STATE_WAITING_LOCK: {
-                    // 核心：忽略触发之前的陈旧结果
                     if (mTriggerFrameNumber == -1 || result.getFrameNumber() < mTriggerFrameNumber) {
                         return;
                     }
@@ -220,13 +240,12 @@ public class MainActivity extends AppCompatActivity {
 
     private void lockFocus() {
         try {
-            mTriggerFrameNumber = -1; // 重置
+            mTriggerFrameNumber = -1;
             captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START);
             captureRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_START);
             
             mState = STATE_WAITING_LOCK;
             
-            // 使用一个临时的回调来捕获 Trigger 请求的帧序号
             cameraCaptureSessions.capture(captureRequestBuilder.build(), new CameraCaptureSession.CaptureCallback() {
                 @Override
                 public void onCaptureCompleted(@NonNull CameraCaptureSession session, @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
@@ -234,7 +253,6 @@ public class MainActivity extends AppCompatActivity {
                 }
             }, mBackgroundHandler);
             
-            // 立即重置触发器，并更新重复请求
             captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE);
             captureRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE);
             cameraCaptureSessions.setRepeatingRequest(captureRequestBuilder.build(), mCaptureCallback, mBackgroundHandler);
@@ -259,7 +277,8 @@ public class MainActivity extends AppCompatActivity {
             setAutoFlash(captureBuilder);
 
             int rotation = getWindowManager().getDefaultDisplay().getRotation();
-            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, (ORIENTATIONS.get(rotation) + sensorOrientation + 270) % 360);
+            int jpegOrientation = (ORIENTATIONS.get(rotation) + sensorOrientation + 270) % 360;
+            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation);
 
             CameraCaptureSession.CaptureCallback captureCallback = new CameraCaptureSession.CaptureCallback() {
                 @Override
@@ -274,17 +293,14 @@ public class MainActivity extends AppCompatActivity {
 
     private void unlockFocus() {
         try {
-            // 1. 取消触发器
             captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 captureRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_CANCEL);
             }
             
-            // 2. 强制切换 AE 模式以重置 HAL 内部状态机
             captureRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
             cameraCaptureSessions.capture(captureRequestBuilder.build(), null, mBackgroundHandler);
 
-            // 3. 恢复自动闪光和 IDLE 状态
             setAutoFlash(captureRequestBuilder);
             captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE);
             captureRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE);
@@ -300,7 +316,7 @@ public class MainActivity extends AppCompatActivity {
                 Uri uri = Uri.parse(pathOrUri);
                 Bitmap bitmap;
                 BitmapFactory.Options options = new BitmapFactory.Options();
-                options.inSampleSize = 8; // Scale down for thumbnail
+                options.inSampleSize = 8;
                 
                 try (InputStream is = getContentResolver().openInputStream(uri)) {
                     bitmap = BitmapFactory.decodeStream(is, null, options);
@@ -352,12 +368,13 @@ public class MainActivity extends AppCompatActivity {
             Boolean available = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
             mFlashSupported = available == null ? false : available;
 
-            Size[] jpegSizes = map.getOutputSizes(ImageFormat.JPEG);
+            int format = isYuvMode ? ImageFormat.YUV_420_888 : ImageFormat.JPEG;
+            Size[] outputSizes = map.getOutputSizes(format);
             int width = 640, height = 480;
-            if (jpegSizes != null && jpegSizes.length > 0) {
-                width = jpegSizes[0].getWidth(); height = jpegSizes[0].getHeight();
+            if (outputSizes != null && outputSizes.length > 0) {
+                width = outputSizes[0].getWidth(); height = outputSizes[0].getHeight();
             }
-            imageReader = ImageReader.newInstance(width, height, ImageFormat.JPEG, 2);
+            imageReader = ImageReader.newInstance(width, height, format, 2);
             imageReader.setOnImageAvailableListener(readerListener, mBackgroundHandler);
 
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -373,31 +390,100 @@ public class MainActivity extends AppCompatActivity {
         public void onImageAvailable(ImageReader reader) {
             try (Image image = reader.acquireLatestImage()) {
                 if (image == null) return;
-                ByteBuffer buffer = image.getPlanes()[0].getBuffer();
-                byte[] bytes = new byte[buffer.remaining()];
-                buffer.get(bytes);
+                
+                byte[] jpegBytes;
+                int rotation = getWindowManager().getDefaultDisplay().getRotation();
+                int jpegOrientation = (ORIENTATIONS.get(rotation) + sensorOrientation + 270) % 360;
+
+                if (image.getFormat() == ImageFormat.JPEG) {
+                    ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+                    jpegBytes = new byte[buffer.remaining()];
+                    buffer.get(jpegBytes);
+                } else if (image.getFormat() == ImageFormat.YUV_420_888) {
+                    jpegBytes = yuvToJpeg(image, jpegOrientation);
+                } else {
+                    return;
+                }
                 
                 // Add watermark "flash demo"
-                byte[] watermarkedBytes = addWatermark(bytes, "flash demo");
-                saveToGallery(watermarkedBytes);
+                byte[] watermarkedBytes = addWatermark(jpegBytes, "flash demo");
+                saveToGallery(watermarkedBytes, "jpg");
             } catch (IOException e) { Log.e(TAG, "Error saving image", e); }
         }
     };
 
+    private byte[] yuvToJpeg(Image image, int orientation) {
+        long startTime = System.currentTimeMillis();
+        int width = image.getWidth();
+        int height = image.getHeight();
+        byte[] nv21 = yuv420ToNv21(image);
+        YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, width, height, null);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        yuvImage.compressToJpeg(new Rect(0, 0, width, height), 90, out);
+        byte[] jpegBytes = out.toByteArray();
+        
+        // Correct rotation for YUV conversion as YuvImage doesn't handle orientation
+        Bitmap bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
+        if (orientation != 0) {
+            Matrix matrix = new Matrix();
+            matrix.postRotate(orientation);
+            Bitmap rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+            ByteArrayOutputStream rotatedOut = new ByteArrayOutputStream();
+            rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, 90, rotatedOut);
+            jpegBytes = rotatedOut.toByteArray();
+            bitmap.recycle();
+            rotatedBitmap.recycle();
+        }
+
+        long endTime = System.currentTimeMillis();
+        Log.d(TAG, "YUV to JPEG conversion took: " + (endTime - startTime) + " ms");
+        return jpegBytes;
+    }
+
+    private byte[] yuv420ToNv21(Image image) {
+        int width = image.getWidth();
+        int height = image.getHeight();
+        byte[] nv21 = new byte[width * height * 3 / 2];
+        Image.Plane[] planes = image.getPlanes();
+        ByteBuffer yBuffer = planes[0].getBuffer();
+        ByteBuffer uBuffer = planes[1].getBuffer();
+        ByteBuffer vBuffer = planes[2].getBuffer();
+
+        int yRowStride = planes[0].getRowStride();
+        int yPos = 0;
+        for (int row = 0; row < height; row++) {
+            yBuffer.position(row * yRowStride);
+            yBuffer.get(nv21, yPos, width);
+            yPos += width;
+        }
+
+        int uvRowStride = planes[1].getRowStride();
+        int uvPixelStride = planes[1].getPixelStride();
+        int uvPos = width * height;
+        for (int row = 0; row < height / 2; row++) {
+            for (int col = 0; col < width / 2; col++) {
+                // NV21 is V-U interleaved
+                nv21[uvPos++] = vBuffer.get(row * uvRowStride + col * uvPixelStride);
+                nv21[uvPos++] = uBuffer.get(row * uvRowStride + col * uvPixelStride);
+            }
+        }
+        return nv21;
+    }
+
     private byte[] addWatermark(byte[] bytes, String text) {
         long startTime = System.currentTimeMillis();
         Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+        if (bitmap == null) return bytes;
         Bitmap mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true);
         Canvas canvas = new Canvas(mutableBitmap);
         
         Paint paint = new Paint();
         paint.setColor(Color.WHITE);
-        paint.setAlpha(180); // Semi-transparent
-        paint.setTextSize(mutableBitmap.getWidth() / 20f); // Responsive text size
+        paint.setAlpha(180);
+        paint.setTextSize(mutableBitmap.getWidth() / 20f);
         paint.setAntiAlias(true);
-        paint.setShadowLayer(5.0f, 2.0f, 2.0f, Color.BLACK); // Add shadow for visibility
+        paint.setShadowLayer(5.0f, 2.0f, 2.0f, Color.BLACK);
         
-        // Draw at bottom-left corner with some padding
         float padding = mutableBitmap.getWidth() / 40f;
         canvas.drawText(text, padding, mutableBitmap.getHeight() - padding, paint);
         
@@ -413,10 +499,10 @@ public class MainActivity extends AppCompatActivity {
         return result;
     }
 
-    private void saveToGallery(byte[] bytes) throws IOException {
+    private void saveToGallery(byte[] bytes, String extension) throws IOException {
         String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(new Date());
         ContentValues values = new ContentValues();
-        values.put(MediaStore.Images.Media.DISPLAY_NAME, "IMG_" + timeStamp + ".jpg");
+        values.put(MediaStore.Images.Media.DISPLAY_NAME, "IMG_" + timeStamp + "." + extension);
         values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
         values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/FlashDemo");
         Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
@@ -447,9 +533,22 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void closeCamera() {
-        if (null != cameraDevice) { cameraDevice.close(); cameraDevice = null; }
-        if (null != imageReader) { imageReader.close(); imageReader = null; }
-        if (null != previewSurface) { previewSurface.release(); previewSurface = null; }
+        if (null != cameraCaptureSessions) {
+            cameraCaptureSessions.close();
+            cameraCaptureSessions = null;
+        }
+        if (null != cameraDevice) {
+            cameraDevice.close();
+            cameraDevice = null;
+        }
+        if (null != imageReader) {
+            imageReader.close();
+            imageReader = null;
+        }
+        if (null != previewSurface) {
+            previewSurface.release();
+            previewSurface = null;
+        }
     }
 
     @Override
