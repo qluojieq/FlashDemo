@@ -35,6 +35,11 @@ public class PhotoActivity extends AppCompatActivity {
         ViewPager2 viewPager = findViewById(R.id.viewPager);
         PhotoAdapter adapter = new PhotoAdapter(photoPaths);
         viewPager.setAdapter(adapter);
+
+        // Jump to the last item (the newest photo)
+        if (!photoPaths.isEmpty()) {
+            viewPager.setCurrentItem(photoPaths.size() - 1, false);
+        }
     }
 
     private class PhotoAdapter extends RecyclerView.Adapter<PhotoAdapter.ViewHolder> {
