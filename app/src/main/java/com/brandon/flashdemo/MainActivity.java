@@ -274,14 +274,18 @@ public class MainActivity extends AppCompatActivity {
             }
             
             captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-            setAutoFlash(captureBuilder);
+            
+            // 连拍 3 张时，强制开启闪光灯 TORCH 模式，确保整个序列都有光
+            if (mFlashSupported && isYuvMode) {
+                captureBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH);
+            } else {
+                setAutoFlash(captureBuilder);
+            }
 
-            // 核心修复：锁定 AE 确保连拍过程中闪光灯和曝光参数保持一致
             captureBuilder.set(CaptureRequest.CONTROL_AE_LOCK, true);
             captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, 0);
 
             if (isYuvMode) {
-                // YUV 模式：连拍 3 张
                 List<CaptureRequest> burstRequests = new ArrayList<>();
                 for (int i = 0; i < 3; i++) {
                     burstRequests.add(captureBuilder.build());
@@ -293,7 +297,6 @@ public class MainActivity extends AppCompatActivity {
                     }
                 }, mBackgroundHandler);
             } else {
-                // JPEG 模式：单拍 1 张
                 cameraCaptureSessions.capture(captureBuilder.build(), new CameraCaptureSession.CaptureCallback() {
                     @Override
                     public void onCaptureCompleted(@NonNull CameraCaptureSession session, @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
@@ -311,8 +314,9 @@ public class MainActivity extends AppCompatActivity {
                 captureRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_CANCEL);
             }
             
-            // 恢复预览前必须解锁 AE
             captureRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, false);
+            // 拍照结束，关闭强制开启的闪光灯
+            captureRequestBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF);
             captureRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
             cameraCaptureSessions.capture(captureRequestBuilder.build(), null, mBackgroundHandler);
 
@@ -389,7 +393,6 @@ public class MainActivity extends AppCompatActivity {
             if (outputSizes != null && outputSizes.length > 0) {
                 width = outputSizes[0].getWidth(); height = outputSizes[0].getHeight();
             }
-            // 修复：如果处于连拍模式，增加 maxImages 缓存容量，防止丢帧
             int maxImages = isYuvMode ? 6 : 2;
             imageReader = ImageReader.newInstance(width, height, format, maxImages);
             imageReader.setOnImageAvailableListener(readerListener, mBackgroundHandler);
@@ -405,8 +408,6 @@ public class MainActivity extends AppCompatActivity {
     private final ImageReader.OnImageAvailableListener readerListener = new ImageReader.OnImageAvailableListener() {
         @Override
         public void onImageAvailable(ImageReader reader) {
-            // 核心修复：使用 acquireNextImage 而不是 acquireLatestImage
-            // acquireLatestImage 会丢弃旧帧，导致连拍时只能拿到最后一张或中间丢帧。
             try (Image image = reader.acquireNextImage()) {
                 if (image == null) return;
                 
@@ -436,7 +437,6 @@ public class MainActivity extends AppCompatActivity {
         }
     };
 
-    // 优化后的 YUV 转 Bitmap 逻辑
     private Bitmap yuvToBitmapOptimized(Image image) {
         long start = System.currentTimeMillis();
         int width = image.getWidth();
@@ -445,7 +445,6 @@ public class MainActivity extends AppCompatActivity {
         
         YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, width, height, null);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        // 适当降低质量（如 95）能显著提升压缩速度，且肉眼几乎无损
         yuvImage.compressToJpeg(new Rect(0, 0, width, height), 95, out);
         byte[] jpegBytes = out.toByteArray();
         Bitmap bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
@@ -454,7 +453,6 @@ public class MainActivity extends AppCompatActivity {
         return bitmap;
     }
 
-    // 修复后的内存拷贝逻辑
     private byte[] yuv420ToNv21Optimized(Image image) {
         int width = image.getWidth();
         int height = image.getHeight();
@@ -467,7 +465,6 @@ public class MainActivity extends AppCompatActivity {
         ByteBuffer uBuffer = planes[1].getBuffer();
         ByteBuffer vBuffer = planes[2].getBuffer();
 
-        // Y Plane 批量拷贝
         int yRowStride = planes[0].getRowStride();
         if (yRowStride == width) {
             yBuffer.get(nv21, 0, ySize);
@@ -478,23 +475,19 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        // UV Plane 优化拷贝
         int uvRowStride = planes[1].getRowStride();
         int uvPixelStride = planes[1].getPixelStride();
         
         if (uvPixelStride == 2) {
-            // 情况 A：UV 交错布局（常见情况）
             if (uvRowStride == width) {
                 int remaining = vBuffer.remaining();
                 if (remaining >= uvSize) {
                     vBuffer.get(nv21, ySize, uvSize);
                 } else {
-                    // 修复 BufferUnderflowException: 如果差一个字节，手动补齐
                     vBuffer.get(nv21, ySize, remaining);
                     nv21[ySize + remaining] = uBuffer.get(uBuffer.limit() - 1);
                 }
             } else {
-                // Stride 不匹配时，按行批量拷贝（比逐字节循环快得多）
                 for (int i = 0; i < height / 2; i++) {
                     vBuffer.position(i * uvRowStride);
                     int bytesToCopy = Math.min(width, vBuffer.remaining());
@@ -505,7 +498,6 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
         } else {
-            // 情况 B：非交错布局，回退到手动合并
             int uvPos = ySize;
             for (int i = 0; i < height / 2; i++) {
                 int vOff = i * planes[2].getRowStride();
@@ -519,7 +511,6 @@ public class MainActivity extends AppCompatActivity {
         return nv21;
     }
 
-    // 合并旋转、水印 and 压缩，只进行一次位图操作和压缩
     private byte[] processBitmapAndSave(Bitmap source, int orientation, String text) {
         long start = System.currentTimeMillis();
         int width = source.getWidth();
@@ -531,7 +522,6 @@ public class MainActivity extends AppCompatActivity {
         Bitmap result = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(result);
         
-        // 1. 旋转
         if (orientation != 0) {
             Matrix matrix = new Matrix();
             matrix.postRotate(orientation);
@@ -543,7 +533,6 @@ public class MainActivity extends AppCompatActivity {
             canvas.drawBitmap(source, 0, 0, null);
         }
         
-        // 2. 水印
         Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         paint.setColor(Color.WHITE);
         paint.setAlpha(180);
@@ -552,7 +541,6 @@ public class MainActivity extends AppCompatActivity {
         float padding = targetWidth / 40f;
         canvas.drawText(text, padding, targetHeight - padding, paint);
         
-        // 3. 最终压缩
         ByteArrayOutputStream stream = new ByteArrayOutputStream();
         result.compress(Bitmap.CompressFormat.JPEG, 90, stream);
         
