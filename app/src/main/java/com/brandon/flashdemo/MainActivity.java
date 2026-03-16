@@ -388,115 +388,144 @@ public class MainActivity extends AppCompatActivity {
     private final ImageReader.OnImageAvailableListener readerListener = new ImageReader.OnImageAvailableListener() {
         @Override
         public void onImageAvailable(ImageReader reader) {
+            long totalPipeStart = System.currentTimeMillis();
             try (Image image = reader.acquireLatestImage()) {
                 if (image == null) return;
                 
-                byte[] jpegBytes;
                 int rotation = getWindowManager().getDefaultDisplay().getRotation();
-                int jpegOrientation = (ORIENTATIONS.get(rotation) + sensorOrientation + 270) % 360;
+                int orientation = (ORIENTATIONS.get(rotation) + sensorOrientation + 270) % 360;
 
+                Bitmap bitmap;
                 if (image.getFormat() == ImageFormat.JPEG) {
                     ByteBuffer buffer = image.getPlanes()[0].getBuffer();
-                    jpegBytes = new byte[buffer.remaining()];
-                    buffer.get(jpegBytes);
+                    byte[] bytes = new byte[buffer.remaining()];
+                    buffer.get(bytes);
+                    bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
                 } else if (image.getFormat() == ImageFormat.YUV_420_888) {
-                    jpegBytes = yuvToJpeg(image, jpegOrientation);
+                    bitmap = yuvToBitmapOptimized(image);
                 } else {
                     return;
                 }
                 
-                // Add watermark "flash demo"
-                byte[] watermarkedBytes = addWatermark(jpegBytes, "flash demo");
-                saveToGallery(watermarkedBytes, "jpg");
-            } catch (IOException e) { Log.e(TAG, "Error saving image", e); }
+                // 核心：合并旋转校正和水印处理，减少编解码次数
+                byte[] finalJpeg = processBitmapAndSave(bitmap, orientation, "Brandon");
+                saveToGallery(finalJpeg, "jpg");
+                
+                Log.d(TAG, "Total Image Pipeline took: " + (System.currentTimeMillis() - totalPipeStart) + " ms");
+            } catch (IOException e) { Log.e(TAG, "Error processing image", e); }
         }
     };
 
-    private byte[] yuvToJpeg(Image image, int orientation) {
-        long startTime = System.currentTimeMillis();
+    // 优化后的 YUV 转 Bitmap 逻辑
+    private Bitmap yuvToBitmapOptimized(Image image) {
+        long start = System.currentTimeMillis();
         int width = image.getWidth();
         int height = image.getHeight();
-        byte[] nv21 = yuv420ToNv21(image);
+        byte[] nv21 = yuv420ToNv21Optimized(image);
+        
         YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, width, height, null);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        yuvImage.compressToJpeg(new Rect(0, 0, width, height), 90, out);
+        // 使用 100 质量以减少中间损失，YuvImage.compressToJpeg 是原生方法，相对较快
+        yuvImage.compressToJpeg(new Rect(0, 0, width, height), 100, out);
         byte[] jpegBytes = out.toByteArray();
-        
-        // Correct rotation for YUV conversion as YuvImage doesn't handle orientation
         Bitmap bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
-        if (orientation != 0) {
-            Matrix matrix = new Matrix();
-            matrix.postRotate(orientation);
-            Bitmap rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
-            ByteArrayOutputStream rotatedOut = new ByteArrayOutputStream();
-            rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, 90, rotatedOut);
-            jpegBytes = rotatedOut.toByteArray();
-            bitmap.recycle();
-            rotatedBitmap.recycle();
-        }
-
-        long endTime = System.currentTimeMillis();
-        Log.d(TAG, "YUV to JPEG conversion took: " + (endTime - startTime) + " ms");
-        return jpegBytes;
+        
+        Log.d(TAG, "YUV -> Bitmap (inc. NV21 copy) took: " + (System.currentTimeMillis() - start) + " ms");
+        return bitmap;
     }
 
-    private byte[] yuv420ToNv21(Image image) {
+    // 优化后的内存拷贝逻辑，使用批量 get
+    private byte[] yuv420ToNv21Optimized(Image image) {
         int width = image.getWidth();
         int height = image.getHeight();
-        byte[] nv21 = new byte[width * height * 3 / 2];
+        int ySize = width * height;
+        int uvSize = width * height / 2;
+        byte[] nv21 = new byte[ySize + uvSize];
+
         Image.Plane[] planes = image.getPlanes();
         ByteBuffer yBuffer = planes[0].getBuffer();
         ByteBuffer uBuffer = planes[1].getBuffer();
         ByteBuffer vBuffer = planes[2].getBuffer();
 
+        // Y Plane 批量拷贝
         int yRowStride = planes[0].getRowStride();
-        int yPos = 0;
-        for (int row = 0; row < height; row++) {
-            yBuffer.position(row * yRowStride);
-            yBuffer.get(nv21, yPos, width);
-            yPos += width;
+        if (yRowStride == width) {
+            yBuffer.get(nv21, 0, ySize);
+        } else {
+            for (int i = 0; i < height; i++) {
+                yBuffer.position(i * yRowStride);
+                yBuffer.get(nv21, i * width, width);
+            }
         }
 
+        // UV Plane 优化拷贝
         int uvRowStride = planes[1].getRowStride();
         int uvPixelStride = planes[1].getPixelStride();
-        int uvPos = width * height;
-        for (int row = 0; row < height / 2; row++) {
-            for (int col = 0; col < width / 2; col++) {
-                // NV21 is V-U interleaved
-                nv21[uvPos++] = vBuffer.get(row * uvRowStride + col * uvPixelStride);
-                nv21[uvPos++] = uBuffer.get(row * uvRowStride + col * uvPixelStride);
+        
+        // 针对大多数设备的常见布局（U/V 交错且 PixelStride=2）进行优化
+        if (uvPixelStride == 2 && uvRowStride == width && vBuffer.remaining() >= uvSize - 1) {
+            vBuffer.get(nv21, ySize, uvSize);
+        } else {
+            // 兜底方案：尽量减少 Buffer.get(index) 的调用
+            byte[] vRow = new byte[uvRowStride];
+            byte[] uRow = new byte[uvRowStride];
+            int uvPos = ySize;
+            for (int i = 0; i < height / 2; i++) {
+                vBuffer.position(i * uvRowStride);
+                vBuffer.get(vRow, 0, Math.min(uvRowStride, vBuffer.remaining()));
+                uBuffer.position(i * uvRowStride);
+                uBuffer.get(uRow, 0, Math.min(uvRowStride, uBuffer.remaining()));
+                for (int j = 0; j < width / 2; j++) {
+                    nv21[uvPos++] = vRow[j * uvPixelStride];
+                    nv21[uvPos++] = uRow[j * uvPixelStride];
+                }
             }
         }
         return nv21;
     }
 
-    private byte[] addWatermark(byte[] bytes, String text) {
-        long startTime = System.currentTimeMillis();
-        Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
-        if (bitmap == null) return bytes;
-        Bitmap mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true);
-        Canvas canvas = new Canvas(mutableBitmap);
+    // 合并旋转、水印和压缩，只进行一次位图操作和压缩
+    private byte[] processBitmapAndSave(Bitmap source, int orientation, String text) {
+        long start = System.currentTimeMillis();
+        int width = source.getWidth();
+        int height = source.getHeight();
         
-        Paint paint = new Paint();
+        int targetWidth = (orientation == 90 || orientation == 270) ? height : width;
+        int targetHeight = (orientation == 90 || orientation == 270) ? width : height;
+        
+        Bitmap result = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(result);
+        
+        // 1. 旋转
+        if (orientation != 0) {
+            Matrix matrix = new Matrix();
+            matrix.postRotate(orientation);
+            if (orientation == 90) matrix.postTranslate(height, 0);
+            else if (orientation == 180) matrix.postTranslate(width, height);
+            else if (orientation == 270) matrix.postTranslate(0, width);
+            canvas.drawBitmap(source, matrix, null);
+        } else {
+            canvas.drawBitmap(source, 0, 0, null);
+        }
+        
+        // 2. 水印
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         paint.setColor(Color.WHITE);
         paint.setAlpha(180);
-        paint.setTextSize(mutableBitmap.getWidth() / 20f);
-        paint.setAntiAlias(true);
-        paint.setShadowLayer(5.0f, 2.0f, 2.0f, Color.BLACK);
+        paint.setTextSize(targetWidth / 20f);
+        paint.setShadowLayer(5f, 2f, 2f, Color.BLACK);
+        float padding = targetWidth / 40f;
+        canvas.drawText(text, padding, targetHeight - padding, paint);
         
-        float padding = mutableBitmap.getWidth() / 40f;
-        canvas.drawText(text, padding, mutableBitmap.getHeight() - padding, paint);
-        
+        // 3. 最终压缩
         ByteArrayOutputStream stream = new ByteArrayOutputStream();
-        mutableBitmap.compress(Bitmap.CompressFormat.JPEG, 90, stream);
+        result.compress(Bitmap.CompressFormat.JPEG, 90, stream);
         
-        bitmap.recycle();
-        mutableBitmap.recycle();
+        source.recycle();
+        result.recycle();
         
-        byte[] result = stream.toByteArray();
-        long endTime = System.currentTimeMillis();
-        Log.d(TAG, "Watermark processing took: " + (endTime - startTime) + " ms");
-        return result;
+        Log.d(TAG, "Bitmap Trans/Watermark/Compress took: " + (System.currentTimeMillis() - start) + " ms");
+        return stream.toByteArray();
     }
 
     private void saveToGallery(byte[] bytes, String extension) throws IOException {
