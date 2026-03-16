@@ -14,6 +14,7 @@ import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
@@ -45,6 +46,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
@@ -60,11 +62,10 @@ public class MainActivity extends AppCompatActivity {
 
     private static final int STATE_PREVIEW = 0;
     private static final int STATE_WAITING_LOCK = 1;
-    private static final int STATE_WAITING_PRECAPTURE = 2;
-    private static final int STATE_WAITING_NON_PRECAPTURE = 3;
-    private static final int STATE_PICTURE_TAKEN = 4;
+    private static final int STATE_PICTURE_TAKEN = 2;
 
     private int mState = STATE_PREVIEW;
+    private long mTriggerFrameNumber = -1; // 用于过滤陈旧帧
 
     private static final SparseIntArray ORIENTATIONS = new SparseIntArray();
     static {
@@ -85,6 +86,8 @@ public class MainActivity extends AppCompatActivity {
     private Size imageDimension;
     private int sensorOrientation;
     private ImageReader imageReader;
+    private boolean mFlashSupported;
+    private Surface previewSurface;
 
     private Handler mBackgroundHandler;
     private HandlerThread mBackgroundThread;
@@ -161,32 +164,24 @@ public class MainActivity extends AppCompatActivity {
             switch (mState) {
                 case STATE_PREVIEW: break;
                 case STATE_WAITING_LOCK: {
+                    // 核心：忽略触发之前的陈旧结果
+                    if (mTriggerFrameNumber == -1 || result.getFrameNumber() < mTriggerFrameNumber) {
+                        return;
+                    }
+
                     Integer afState = result.get(CaptureResult.CONTROL_AF_STATE);
-                    if (afState == null) {
-                        captureStillPicture();
-                    } else if (CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED == afState ||
-                            CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED == afState) {
-                        Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
-                        if (aeState == null || aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED) {
-                            mState = STATE_PICTURE_TAKEN;
-                            captureStillPicture();
-                        } else {
-                            runPrecaptureSequence();
-                        }
-                    }
-                    break;
-                }
-                case STATE_WAITING_PRECAPTURE: {
                     Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
-                    if (aeState == null || aeState == CaptureResult.CONTROL_AE_STATE_PRECAPTURE ||
-                            aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED) {
-                        mState = STATE_WAITING_NON_PRECAPTURE;
-                    }
-                    break;
-                }
-                case STATE_WAITING_NON_PRECAPTURE: {
-                    Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
-                    if (aeState == null || aeState != CaptureResult.CONTROL_AE_STATE_PRECAPTURE) {
+                    
+                    boolean afReady = afState == null || 
+                                     afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                                     afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED;
+                                     
+                    boolean aeReady = aeState == null || 
+                                     aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+                                     aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
+                                     aeState == CaptureResult.CONTROL_AE_STATE_LOCKED;
+
+                    if (afReady && aeReady) {
                         mState = STATE_PICTURE_TAKEN;
                         captureStillPicture();
                     }
@@ -221,21 +216,29 @@ public class MainActivity extends AppCompatActivity {
 
     private void lockFocus() {
         try {
-            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
+            mTriggerFrameNumber = -1; // 重置
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START);
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_START);
+            
             mState = STATE_WAITING_LOCK;
-            cameraCaptureSessions.capture(captureRequestBuilder.build(), mCaptureCallback, mBackgroundHandler);
-        } catch (CameraAccessException e) { e.printStackTrace(); }
-    }
-
-    private void runPrecaptureSequence() {
-        try {
-            captureRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START);
-            mState = STATE_WAITING_PRECAPTURE;
-            cameraCaptureSessions.capture(captureRequestBuilder.build(), mCaptureCallback, mBackgroundHandler);
+            
+            // 使用一个临时的回调来捕获 Trigger 请求的帧序号
+            cameraCaptureSessions.capture(captureRequestBuilder.build(), new CameraCaptureSession.CaptureCallback() {
+                @Override
+                public void onCaptureCompleted(@NonNull CameraCaptureSession session, @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
+                    mTriggerFrameNumber = result.getFrameNumber();
+                }
+            }, mBackgroundHandler);
+            
+            // 立即重置触发器，并更新重复请求
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE);
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE);
+            cameraCaptureSessions.setRepeatingRequest(captureRequestBuilder.build(), mCaptureCallback, mBackgroundHandler);
         } catch (CameraAccessException e) { e.printStackTrace(); }
     }
 
     protected void takePicture() {
+        if (mState != STATE_PREVIEW) return;
         lockFocus();
     }
 
@@ -244,7 +247,13 @@ public class MainActivity extends AppCompatActivity {
             if (null == cameraDevice) return;
             final CaptureRequest.Builder captureBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
             captureBuilder.addTarget(imageReader.getSurface());
-            captureBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
+            if (previewSurface != null) {
+                captureBuilder.addTarget(previewSurface);
+            }
+            
+            captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+            setAutoFlash(captureBuilder);
+
             int rotation = getWindowManager().getDefaultDisplay().getRotation();
             captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, (ORIENTATIONS.get(rotation) + sensorOrientation + 270) % 360);
 
@@ -254,28 +263,52 @@ public class MainActivity extends AppCompatActivity {
                     unlockFocus();
                 }
             };
-            cameraCaptureSessions.stopRepeating();
-            cameraCaptureSessions.abortCaptures();
-            cameraCaptureSessions.capture(captureBuilder.build(), captureCallback, null);
+            
+            cameraCaptureSessions.capture(captureBuilder.build(), captureCallback, mBackgroundHandler);
         } catch (CameraAccessException e) { e.printStackTrace(); }
     }
 
     private void unlockFocus() {
         try {
-            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL);
-            cameraCaptureSessions.capture(captureRequestBuilder.build(), mCaptureCallback, mBackgroundHandler);
+            // 1. 取消触发器
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                captureRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_CANCEL);
+            }
+            
+            // 2. 强制切换 AE 模式以重置 HAL 内部状态机
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+            cameraCaptureSessions.capture(captureRequestBuilder.build(), null, mBackgroundHandler);
+
+            // 3. 恢复自动闪光和 IDLE 状态
+            setAutoFlash(captureRequestBuilder);
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE);
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE);
+            
             mState = STATE_PREVIEW;
             cameraCaptureSessions.setRepeatingRequest(captureRequestBuilder.build(), mCaptureCallback, mBackgroundHandler);
         } catch (CameraAccessException e) { e.printStackTrace(); }
     }
 
-    private void updateThumbnail(String pathOrUri) {
-        try {
-            Bitmap bitmap = pathOrUri.startsWith("content://") ?
-                    MediaStore.Images.Media.getBitmap(this.getContentResolver(), Uri.parse(pathOrUri)) :
-                    BitmapFactory.decodeFile(pathOrUri);
-            ivThumbnail.setImageBitmap(bitmap);
-        } catch (IOException e) { Log.e(TAG, "Error updating thumbnail", e); }
+    private void updateThumbnailAsync(String pathOrUri) {
+        mBackgroundHandler.post(() -> {
+            try {
+                Uri uri = Uri.parse(pathOrUri);
+                Bitmap bitmap;
+                BitmapFactory.Options options = new BitmapFactory.Options();
+                options.inSampleSize = 8; // Scale down for thumbnail
+                
+                try (InputStream is = getContentResolver().openInputStream(uri)) {
+                    bitmap = BitmapFactory.decodeStream(is, null, options);
+                }
+                
+                if (bitmap != null) {
+                    runOnUiThread(() -> ivThumbnail.setImageBitmap(bitmap));
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Error updating thumbnail", e);
+            }
+        });
     }
 
     protected void createCameraPreview() {
@@ -283,10 +316,12 @@ public class MainActivity extends AppCompatActivity {
             SurfaceTexture texture = textureView.getSurfaceTexture();
             assert texture != null;
             texture.setDefaultBufferSize(imageDimension.getWidth(), imageDimension.getHeight());
-            Surface surface = new Surface(texture);
+            previewSurface = new Surface(texture);
             captureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            captureRequestBuilder.addTarget(surface);
-            cameraDevice.createCaptureSession(Arrays.asList(surface, imageReader.getSurface()), new CameraCaptureSession.StateCallback() {
+            captureRequestBuilder.addTarget(previewSurface);
+            setAutoFlash(captureRequestBuilder);
+
+            cameraDevice.createCaptureSession(Arrays.asList(previewSurface, imageReader.getSurface()), new CameraCaptureSession.StateCallback() {
                 @Override
                 public void onConfigured(@NonNull CameraCaptureSession cameraCaptureSession) {
                     if (null == cameraDevice) return;
@@ -294,7 +329,7 @@ public class MainActivity extends AppCompatActivity {
                     updatePreview();
                 }
                 @Override public void onConfigureFailed(@NonNull CameraCaptureSession cameraCaptureSession) {
-                    Toast.makeText(MainActivity.this, "Configuration change", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(MainActivity.this, "Configuration failed", Toast.LENGTH_SHORT).show();
                 }
             }, null);
         } catch (CameraAccessException e) { e.printStackTrace(); }
@@ -310,7 +345,10 @@ public class MainActivity extends AppCompatActivity {
             assert map != null;
             imageDimension = map.getOutputSizes(SurfaceTexture.class)[0];
             
-            Size[] jpegSizes = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP).getOutputSizes(ImageFormat.JPEG);
+            Boolean available = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
+            mFlashSupported = available == null ? false : available;
+
+            Size[] jpegSizes = map.getOutputSizes(ImageFormat.JPEG);
             int width = 640, height = 480;
             if (jpegSizes != null && jpegSizes.length > 0) {
                 width = jpegSizes[0].getWidth(); height = jpegSizes[0].getHeight();
@@ -330,6 +368,7 @@ public class MainActivity extends AppCompatActivity {
         @Override
         public void onImageAvailable(ImageReader reader) {
             try (Image image = reader.acquireLatestImage()) {
+                if (image == null) return;
                 ByteBuffer buffer = image.getPlanes()[0].getBuffer();
                 byte[] bytes = new byte[buffer.remaining()];
                 buffer.get(bytes);
@@ -347,10 +386,11 @@ public class MainActivity extends AppCompatActivity {
         Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
         if (uri != null) {
             try (OutputStream os = getContentResolver().openOutputStream(uri)) { os.write(bytes); }
+            String uriString = uri.toString();
             runOnUiThread(() -> {
-                photoPaths.add(uri.toString());
-                updateThumbnail(uri.toString());
-                Toast.makeText(MainActivity.this, "Saved to Gallery", Toast.LENGTH_SHORT).show();
+                photoPaths.add(uriString);
+                updateThumbnailAsync(uriString);
+                Toast.makeText(MainActivity.this, "Photo saved", Toast.LENGTH_SHORT).show();
             });
         }
     }
@@ -358,14 +398,22 @@ public class MainActivity extends AppCompatActivity {
     protected void updatePreview() {
         if (null == cameraDevice) return;
         captureRequestBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
+        setAutoFlash(captureRequestBuilder);
         try {
             cameraCaptureSessions.setRepeatingRequest(captureRequestBuilder.build(), mCaptureCallback, mBackgroundHandler);
         } catch (CameraAccessException e) { e.printStackTrace(); }
     }
 
+    private void setAutoFlash(CaptureRequest.Builder requestBuilder) {
+        if (mFlashSupported) {
+            requestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH);
+        }
+    }
+
     private void closeCamera() {
         if (null != cameraDevice) { cameraDevice.close(); cameraDevice = null; }
         if (null != imageReader) { imageReader.close(); imageReader = null; }
+        if (null != previewSurface) { previewSurface.release(); previewSurface = null; }
     }
 
     @Override
