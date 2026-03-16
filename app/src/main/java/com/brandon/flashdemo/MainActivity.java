@@ -7,7 +7,10 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
 import android.graphics.ImageFormat;
+import android.graphics.Paint;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
@@ -45,6 +48,7 @@ import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -372,10 +376,42 @@ public class MainActivity extends AppCompatActivity {
                 ByteBuffer buffer = image.getPlanes()[0].getBuffer();
                 byte[] bytes = new byte[buffer.remaining()];
                 buffer.get(bytes);
-                saveToGallery(bytes);
+                
+                // Add watermark "flash demo"
+                byte[] watermarkedBytes = addWatermark(bytes, "flash demo");
+                saveToGallery(watermarkedBytes);
             } catch (IOException e) { Log.e(TAG, "Error saving image", e); }
         }
     };
+
+    private byte[] addWatermark(byte[] bytes, String text) {
+        long startTime = System.currentTimeMillis();
+        Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+        Bitmap mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true);
+        Canvas canvas = new Canvas(mutableBitmap);
+        
+        Paint paint = new Paint();
+        paint.setColor(Color.WHITE);
+        paint.setAlpha(180); // Semi-transparent
+        paint.setTextSize(mutableBitmap.getWidth() / 20f); // Responsive text size
+        paint.setAntiAlias(true);
+        paint.setShadowLayer(5.0f, 2.0f, 2.0f, Color.BLACK); // Add shadow for visibility
+        
+        // Draw at bottom-left corner with some padding
+        float padding = mutableBitmap.getWidth() / 40f;
+        canvas.drawText(text, padding, mutableBitmap.getHeight() - padding, paint);
+        
+        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+        mutableBitmap.compress(Bitmap.CompressFormat.JPEG, 90, stream);
+        
+        bitmap.recycle();
+        mutableBitmap.recycle();
+        
+        byte[] result = stream.toByteArray();
+        long endTime = System.currentTimeMillis();
+        Log.d(TAG, "Watermark processing took: " + (endTime - startTime) + " ms");
+        return result;
+    }
 
     private void saveToGallery(byte[] bytes) throws IOException {
         String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(new Date());
