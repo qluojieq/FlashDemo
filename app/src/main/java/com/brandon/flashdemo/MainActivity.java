@@ -276,9 +276,10 @@ public class MainActivity extends AppCompatActivity {
             captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
             setAutoFlash(captureBuilder);
 
-            int rotation = getWindowManager().getDefaultDisplay().getRotation();
-            int jpegOrientation = (ORIENTATIONS.get(rotation) + sensorOrientation + 270) % 360;
-            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation);
+            // 修复：将 JPEG_ORIENTATION 设置为 0
+            // 因为我们在 readerListener 的后处理流程 processBitmapAndSave 中统一根据传感器方向手动旋转位图。
+            // 如果这里设置了非零值，某些设备硬件会提前旋转像素，导致我们的后处理产生“二次旋转”错误。
+            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, 0);
 
             CameraCaptureSession.CaptureCallback captureCallback = new CameraCaptureSession.CaptureCallback() {
                 @Override
@@ -425,8 +426,8 @@ public class MainActivity extends AppCompatActivity {
         
         YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, width, height, null);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        // 使用 100 质量以减少中间损失，YuvImage.compressToJpeg 是原生方法，相对较快
-        yuvImage.compressToJpeg(new Rect(0, 0, width, height), 100, out);
+        // 适当降低质量（如 95）能显著提升压缩速度，且肉眼几乎无损
+        yuvImage.compressToJpeg(new Rect(0, 0, width, height), 95, out);
         byte[] jpegBytes = out.toByteArray();
         Bitmap bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
         
@@ -434,7 +435,7 @@ public class MainActivity extends AppCompatActivity {
         return bitmap;
     }
 
-    // 优化后的内存拷贝逻辑，使用批量 get
+    // 修复后的内存拷贝逻辑
     private byte[] yuv420ToNv21Optimized(Image image) {
         int width = image.getWidth();
         int height = image.getHeight();
@@ -462,22 +463,37 @@ public class MainActivity extends AppCompatActivity {
         int uvRowStride = planes[1].getRowStride();
         int uvPixelStride = planes[1].getPixelStride();
         
-        // 针对大多数设备的常见布局（U/V 交错且 PixelStride=2）进行优化
-        if (uvPixelStride == 2 && uvRowStride == width && vBuffer.remaining() >= uvSize - 1) {
-            vBuffer.get(nv21, ySize, uvSize);
+        if (uvPixelStride == 2) {
+            // 情况 A：UV 交错布局（常见情况）
+            if (uvRowStride == width) {
+                int remaining = vBuffer.remaining();
+                if (remaining >= uvSize) {
+                    vBuffer.get(nv21, ySize, uvSize);
+                } else {
+                    // 修复 BufferUnderflowException: 如果差一个字节，手动补齐
+                    vBuffer.get(nv21, ySize, remaining);
+                    nv21[ySize + remaining] = uBuffer.get(uBuffer.limit() - 1);
+                }
+            } else {
+                // Stride 不匹配时，按行批量拷贝（比逐字节循环快得多）
+                for (int i = 0; i < height / 2; i++) {
+                    vBuffer.position(i * uvRowStride);
+                    int bytesToCopy = Math.min(width, vBuffer.remaining());
+                    vBuffer.get(nv21, ySize + i * width, bytesToCopy);
+                    if (bytesToCopy < width && i == height / 2 - 1) {
+                         nv21[ySize + i * width + bytesToCopy] = uBuffer.get(uBuffer.limit() - 1);
+                    }
+                }
+            }
         } else {
-            // 兜底方案：尽量减少 Buffer.get(index) 的调用
-            byte[] vRow = new byte[uvRowStride];
-            byte[] uRow = new byte[uvRowStride];
+            // 情况 B：非交错布局，回退到手动合并
             int uvPos = ySize;
             for (int i = 0; i < height / 2; i++) {
-                vBuffer.position(i * uvRowStride);
-                vBuffer.get(vRow, 0, Math.min(uvRowStride, vBuffer.remaining()));
-                uBuffer.position(i * uvRowStride);
-                uBuffer.get(uRow, 0, Math.min(uvRowStride, uBuffer.remaining()));
+                int vOff = i * planes[2].getRowStride();
+                int uOff = i * planes[1].getRowStride();
                 for (int j = 0; j < width / 2; j++) {
-                    nv21[uvPos++] = vRow[j * uvPixelStride];
-                    nv21[uvPos++] = uRow[j * uvPixelStride];
+                    nv21[uvPos++] = vBuffer.get(vOff + j * planes[2].getPixelStride());
+                    nv21[uvPos++] = uBuffer.get(uOff + j * planes[1].getPixelStride());
                 }
             }
         }
